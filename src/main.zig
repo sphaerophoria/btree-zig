@@ -33,7 +33,7 @@ fn serializeNode(json_writer: anytype, node: anytype) !void {
     try json_writer.endArray();
 }
 
-fn serializeTree(alloc: Allocator, btree: anytype, inserter: anytype) ![]const u8 {
+fn serializeTree(alloc: Allocator, btree: anytype, worker: anytype) ![]const u8 {
     var ret = std.ArrayList(u8).init(alloc);
 
     var json_writer = std.json.writeStream(ret.writer(), .{.whitespace = .indent_2});
@@ -45,31 +45,45 @@ fn serializeTree(alloc: Allocator, btree: anytype, inserter: anytype) ![]const u
     try json_writer.objectField("node_capacity");
     try json_writer.write(@TypeOf(btree.*).node_capacity);
 
-    try json_writer.objectField("to_insert");
-    if (inserter) |i| {
-        try json_writer.write(i.val);
-    } else {
-        try json_writer.write(null);
-    }
+    switch (worker) {
+        .inserter => |i| {
+            try json_writer.objectField("to_insert");
+            try json_writer.write(i.val);
 
-    try json_writer.objectField("target");
-    if (inserter) |i| {
-        try json_writer.write(i.target);
-    } else {
-        try json_writer.write(null);
-    }
+            try json_writer.objectField("target");
+            try json_writer.write(i.target);
 
-    try json_writer.objectField("to_insert_child");
-    // FIXME: Ew, double nested, duplicate nulls, etc
-    if (inserter) |i| {
-        if (i.in_progress_tree) |t| {
-            try json_writer.write(t);
-        }
-        else {
-            try json_writer.write(null);
-        }
-    } else {
-        try json_writer.write(null);
+            try json_writer.objectField("to_insert_child");
+            if (i.in_progress_tree) |t| {
+                try json_writer.write(t);
+            } else {
+                try json_writer.write(null);
+            }
+        },
+        .deleter => |d| {
+            switch (d.state) {
+                .remove_val => |target_key| {
+                    try json_writer.objectField("to_delete");
+                    try json_writer.write(target_key);
+                },
+                .merge_nodes => |parent_key_idx| {
+                    try json_writer.objectField("to_merge");
+
+                    try json_writer.beginObject();
+
+                    try json_writer.objectField("parent_node");
+                    try json_writer.write(d.parent_stack.getLast());
+
+                    try json_writer.objectField("key_idx");
+                    try json_writer.write(parent_key_idx);
+
+                    try json_writer.endObject();
+                },
+                .find_merge_target, .finished => {},
+
+            }
+        },
+        .none => {},
     }
 
     try json_writer.objectField("inner_nodes");
@@ -128,6 +142,14 @@ fn createInsertSequence() [insert_sequence_size]i32 {
     return ret;
 }
 
+const TestBtree = BTree(4, i32);
+
+const BTreeWorker = union(enum) {
+    inserter: TestBtree.Inserter,
+    deleter: TestBtree.Deleter,
+    none,
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -140,7 +162,6 @@ pub fn main() !void {
         .reuse_port = true,
     });
 
-    const TestBtree = BTree(4, i32);
     var btree = try TestBtree.init(alloc);
     defer btree.deinit();
 
@@ -152,7 +173,7 @@ pub fn main() !void {
         try btree.insert(alloc, insert_sequence[i]);
     }
 
-    var inserter: ?TestBtree.Inserter = null;
+    var worker: BTreeWorker = .none;
 
     // ROOT c1 c2 c3 c11 c12 c13 c21 c22 c23
     while (true) {
@@ -164,7 +185,8 @@ pub fn main() !void {
             var http_server = std.http.Server.init(connection, &read_buf);
             var req = http_server.receiveHead() catch break;
 
-            const target = std.meta.stringToEnum(Target, req.head.target) orelse {
+            const query_param_start = std.mem.indexOfScalar(u8, req.head.target, '?') orelse req.head.target.len;
+            const target = std.meta.stringToEnum(Target, req.head.target[0..query_param_start]) orelse {
                 try req.respond("", .{.status = .not_found});
                 continue;
             };
@@ -177,7 +199,7 @@ pub fn main() !void {
                     try serveFile(alloc, "res/index.js", &req);
                 },
                 .@"/data" => {
-                    const response = try serializeTree(alloc, &btree, inserter);
+                    const response = try serializeTree(alloc, &btree, worker);
                     defer alloc.free(response);
 
                     std.debug.print("Sending response: {s}", .{response});
@@ -191,30 +213,54 @@ pub fn main() !void {
                     });
                 },
                 .@"/step" => {
-                    if (inserter) |*i| {
-                        if (!try i.step()) {
-                            i.deinit();
-                            inserter = null;
-                        }
-                    } else {
-                        if (insert_idx < insert_sequence.len) {
-                            inserter = try btree.inserter(alloc, insert_sequence[insert_idx]);
-                            insert_idx += 1;
-                        }
+                    switch (worker) {
+                        .inserter => |*i| {
+                            if (!try i.step()) {
+                                i.deinit();
+                                worker = .none;
+                            }
+                        },
+                        .deleter => |*d| {
+                            if (!d.step()) {
+                                d.deinit();
+                                worker = .none;
+                            }
+                        },
+                        .none => {
+                            if (insert_idx < insert_sequence.len) {
+                                worker = .{ .inserter = try btree.inserter(alloc, insert_sequence[insert_idx]) };
+                                insert_idx += 1;
+                            }
+                        },
                     }
                     try req.respond("", .{});
                 },
                 .@"/reset" => {
                     btree.deinit();
                     btree = try TestBtree.init(alloc);
-                    inserter = null;
+                    worker = .none;
                     insert_idx = test_start;
                     for (0..test_start) |i| {
                         try btree.insert(alloc, insert_sequence[i]);
                     }
                     try req.respond("", .{});
                 },
-                .@"/delete" => {
+                .@"/delete" => blk: {
+                    const expected_query_start = "?val=";
+                    const val_start = query_param_start + expected_query_start.len;
+                    if (val_start >= req.head.target.len) {
+                        std.log.err("Delete missing val param", .{});
+                        break :blk;
+                    }
+
+                    const val_s = req.head.target[val_start..];
+                    const val = std.fmt.parseInt(i32, val_s, 0) catch {
+                        std.log.err("Delete val not a valid i32", .{});
+                        break :blk;
+                    };
+
+                    worker = .{ .deleter = try btree.deleter(alloc, val) };
+                    try req.respond("", .{});
                 }
             }
 

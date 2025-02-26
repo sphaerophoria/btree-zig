@@ -11,16 +11,26 @@ const NodeType = enum(u1) {
 const NodeId = packed struct (u32) {
     node_type: NodeType,
     index: u31,
+
+    fn eql(self: NodeId, other: NodeId) bool {
+        return std.meta.eql(self, other);
+    }
 };
 
 pub fn BTree(comptime node_capacity_: comptime_int, comptime T: type) type {
     return struct {
         pub const node_capacity = node_capacity_;
         pub const children_capacity = node_capacity + 1;
+        pub const min_node_keys  = node_capacity / 2;
 
         alloc: Allocator,
         inner_nodes: std.ArrayListUnmanaged(InnerNode),
         leaf_nodes: std.ArrayListUnmanaged(LeafNode),
+
+        // FIXME: Free correctly, reset whatever we gotta do
+        free_leaves: std.ArrayListUnmanaged(usize),
+        free_inners: std.ArrayListUnmanaged(usize),
+
         root_node: NodeId = .{ .node_type = .leaf, .index = 0 },
 
         const InnerNode = struct {
@@ -35,6 +45,36 @@ pub fn BTree(comptime node_capacity_: comptime_int, comptime T: type) type {
 
             pub fn numKeys(self: *const InnerNode) usize {
                 return self.num_children -| 1;
+            }
+
+            fn remove(self: *InnerNode, key: T) NodeId {
+
+                const num_keys = self.numKeys();
+                const idx = std.mem.indexOfScalar(T, self.keys[0..num_keys], key) orelse unreachable;
+                std.mem.copyForwards(
+                    T,
+                    self.keys[idx..num_keys - 1],
+                    self.keys[idx + 1..num_keys],
+                );
+                const removed_child_id = self.children[idx + 1];
+                std.mem.copyForwards(
+                    NodeId,
+                    self.children[idx + 1..self.num_children - 1],
+                    self.children[idx + 2..self.num_children],
+                );
+                self.num_children -= 1;
+
+                return removed_child_id;
+            }
+
+            fn findChild(self: *const InnerNode, search_key: NodeId) usize {
+                for (0..self.num_children) |i| {
+                    const child_id = self.children[i];
+                    if (child_id.eql(search_key)) {
+                        return i;
+                    }
+                }
+                unreachable;
             }
 
             fn insert(self: *InnerNode, key_idx: ChildIdx, key: T, child: NodeId) void {
@@ -82,6 +122,16 @@ pub fn BTree(comptime node_capacity_: comptime_int, comptime T: type) type {
                 self.num_keys += 1;
             }
 
+            fn remove(self: *LeafNode, key: T) void {
+                const idx = std.mem.indexOfScalar(T, self.keys[0..self.num_keys], key) orelse unreachable;
+                std.mem.copyForwards(
+                    T,
+                    self.keys[idx..self.num_keys - 1],
+                    self.keys[idx + 1..self.num_keys],
+                );
+                self.num_keys -= 1;
+            }
+
             fn setContents(self: *LeafNode, keys: []const T) void {
                 @memcpy(self.keys[0..keys.len], keys);
                 self.num_keys = @intCast(keys.len);
@@ -91,6 +141,13 @@ pub fn BTree(comptime node_capacity_: comptime_int, comptime T: type) type {
         const Node = union(enum) {
             inner: *InnerNode,
             leaf: *LeafNode,
+
+            fn numKeys(self: Node) usize {
+                return switch (self) {
+                    .inner => |i| i.numKeys(),
+                    .leaf => |l| l.num_keys,
+                };
+            }
         };
 
         // FIXME: how do we dedup with Node
@@ -436,20 +493,160 @@ pub fn BTree(comptime node_capacity_: comptime_int, comptime T: type) type {
             };
         }
 
-        const Deleter = struct {
+        pub const Deleter = struct {
+            btree: *Self,
             target: NodeId,
             parent_stack: std.ArrayList(NodeId),
-            state: enum {
-                remove_val,
+            state: State,
+
+            const TargetAction = union(enum) {
+                delete: T,
+                merge: NodeId,
+                none,
+            };
+
+            const State = union(enum) {
+                remove_val: T,
+                find_merge_target,
+                merge_nodes: usize, // parent key idx
                 finished,
-            },
+            };
+
+            pub fn deinit(self: *Deleter) void {
+                self.parent_stack.deinit();
+            }
+
+            pub fn step(self: *Deleter) bool {
+                while (true) {
+                    switch (self.state) {
+                        .remove_val => |v| {
+                            const next_state = self.doRemove(v);
+                            self.state = next_state;
+                        },
+                        .find_merge_target => {
+                            const next_state = self.doFindMergeTarget();
+                            self.state = next_state;
+                            return true;
+                        },
+                        .merge_nodes => |parent_key_idx| {
+                            self.doMerge(parent_key_idx);
+                            return true;
+                        },
+                        // Find merge neighbor
+                        // Pull parent down
+                        // Delete empty node
+                        .finished => return false,
+                    }
+                }
+            }
+
+            // FIXME: API should probably be key_idx, not val
+            fn doRemove(self: *Deleter, val: T) State {
+                switch (self.target.node_type) {
+                    .leaf => {
+                        const node = self.btree.getByNodeId(self.target);
+                        node.leaf.remove(val);
+
+                        if (node.leaf.num_keys < min_node_keys) {
+                            return .find_merge_target;
+                        }
+                    },
+                    .inner => {
+                        // FIXME: duplication with leaf
+                        const node = self.btree.getByNodeId(self.target);
+                        const removed_node_id = node.inner.remove(val);
+                        self.btree.removeNode(removed_node_id);
+
+                        if (node.inner.numKeys() < min_node_keys) {
+                            return .find_merge_target;
+                        }
+                    },
+                }
+
+                return .finished;
+            }
+
+            fn doFindMergeTarget(self: *Deleter) State {
+                // Look left
+                // Look right
+                if (self.parent_stack.items.len == 0) {
+                    return .finished;
+                }
+
+                const parent_id = self.parent_stack.items[self.parent_stack.items.len - 1];
+                const parent_node = self.btree.getByNodeId(parent_id);
+
+                // FIXME: Maybe we should store our child idx with the parent stack?
+                const target_idx = parent_node.inner.findChild(self.target);
+
+                if (target_idx != 0) {
+                    const left_node_id = parent_node.inner.children[target_idx - 1];
+                    const left_node = self.btree.getByNodeId(left_node_id);
+                    if (left_node.numKeys() != node_capacity) {
+                        return .{
+                            .merge_nodes = target_idx - 1
+                        };
+                    }
+                }
+
+                // FIXME: Super duplicated with left node stuff
+                if (target_idx != children_capacity) {
+                    const right_node_id = parent_node.inner.children[target_idx + 1];
+                    const right_node = self.btree.getByNodeId(right_node_id);
+                    if (right_node.numKeys() != node_capacity) {
+                        return .{
+                            .merge_nodes = target_idx,
+                        };
+                    }
+                }
+
+                unreachable;
+            }
+
+            fn doMerge(self: *Deleter, parent_key_idx: usize) void {
+                const parent_id = self.parent_stack.items[self.parent_stack.items.len - 1];
+                const parent = self.btree.getByNodeId(parent_id);
+
+                const left_id = parent.inner.children[parent_key_idx];
+                const right_id = parent.inner.children[parent_key_idx + 1];
+
+                const left_node = self.btree.getByNodeId(left_id);
+                const right_node = self.btree.getByNodeId(right_id);
+
+                std.debug.assert(left_id.node_type == right_id.node_type);
+
+                switch (left_id.node_type) {
+                    .leaf => {
+                        left_node.leaf.keys[left_node.leaf.num_keys] = parent.inner.keys[parent_key_idx];
+                        left_node.leaf.num_keys += 1;
+                        const num_right_keys = right_node.leaf.num_keys;
+                        const left_insert_start = left_node.leaf.num_keys;
+                        const left_insert_end = left_insert_start + num_right_keys;
+                        @memcpy(
+                            left_node.leaf.keys[left_insert_start..left_insert_end],
+                            right_node.leaf.keys[0..num_right_keys],
+                        );
+                        left_node.leaf.num_keys += num_right_keys;
+
+                        self.target = self.parent_stack.pop();
+                        self.state = .{
+                            .remove_val = parent.inner.keys[parent_key_idx],
+                        };
+                        return;
+                    },
+                    .inner => unreachable,
+                }
+
+                unreachable;
+            }
         };
 
         pub fn deleter(self: *Self, alloc: Allocator, val: T) !Deleter {
             var res = try self.findKey(alloc, val);
-            const state = if (res.exists) .remove_val else .finished;
+            const state: Deleter.State = if (res.exists) .{ .remove_val = val} else .finished;
 
             return .{
+                .btree = self,
                 .target = res.parent_stack.pop(),
                 .parent_stack = res.parent_stack,
                 .state = state,
@@ -539,6 +736,15 @@ pub fn BTree(comptime node_capacity_: comptime_int, comptime T: type) type {
             }
         }
 
+        fn removeNode(self: *Self, id: NodeId) void {
+            switch (id.node_type) {
+                .leaf => self.free_leaves.append(self.alloc, id.index),
+                .inner => self.free_inners.append(self.alloc, id.index),
+            }
+        }
+
+        // FIXME: All uses of nextNodeId need to pull from the free list, then
+        // they have to allocate from the free list
         fn nextNodeId(self: *Self, node_type: NodeType) NodeId {
             const next_index = switch (node_type) {
                 .leaf => self.leaf_nodes.items.len,

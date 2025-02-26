@@ -5,11 +5,13 @@ const row_padding = 50;
 const node_padding = 50;
 const half_cell_width = cell_width / 2;
 const half_cell_height = cell_height / 2;
-const cell_color = "#999999"
+const default_cell_color = "#999999";
+const delete_cell_color = "#bb0000";
+const merge_node_color = "#bbbb00";
 
 /** @param {CanvasRenderingContext2D} ctx */
-function renderCell(ctx, num, x, y) {
-    ctx.fillStyle = cell_color;
+function renderCell(ctx, num, x, y, color) {
+    ctx.fillStyle = color;
     ctx.fillRect(
         x - half_cell_width,
         y - half_cell_height,
@@ -48,23 +50,58 @@ function getElemFromData(elem, data) {
     }
 }
 
+function eqlNodeId(a, b) {
+    return a.node_type == b.node_type && a.index == b.index;
+}
+
 function layoutTreeNode(x, y, elem, data, node_width, layout) {
     const elem_data = getElemFromData(elem, data);
     //if (elem_data.keys.length == 0) {
     //    return y;
     //}
     const start_x = x;
-    layout.nodes.push({
+    const layout_node = {
         x: x - half_cell_width,
         y: y,
         val: elem,
-    });
-    for (let cell of elem_data.keys) {
-        layout.cells.push({
+    };
+
+    if (data.to_merge) {
+        const merge_nodes = [];
+        const parent_node = getElemFromData(data.to_merge.parent_node, data);
+
+        merge_nodes.push(parent_node.children[data.to_merge.key_idx]);
+        merge_nodes.push(parent_node.children[data.to_merge.key_idx+ 1]);
+
+        console.log("to_merge", merge_nodes);
+        console.log("elem", elem);
+        for (let merge_elem of merge_nodes) {
+            if (eqlNodeId(merge_elem, elem)) {
+                layout_node.merge_target = true;
+            }
+        }
+    }
+    layout.nodes.push(layout_node);
+    for (let i = 0; i < elem_data.keys.length; i++) {
+        const cell = elem_data.keys[i];
+        const layout_cell = {
             x: x,
             y: y,
             val: cell,
-        })
+        }
+        if (data.to_delete == cell) {
+            layout_cell.to_delete = true;
+        }
+
+        // FIXME: Gross if block, eql node id on every loop, etc
+        if (data.to_merge) {
+            if (eqlNodeId(data.to_merge.parent_node, elem)) {
+                if (i == data.to_merge.key_idx) {
+                    layout_cell.to_merge = true;
+                }
+            }
+        }
+        layout.cells.push(layout_cell)
 
         x += cell_width + cell_padding
     }
@@ -81,6 +118,7 @@ function layoutTreeNode(x, y, elem, data, node_width, layout) {
 }
 
 function renderLayout(ctx, node_width, target, layout) {
+    console.log(layout.nodes);
     for (let elem of layout.nodes) {
         let color = undefined;
         console.log(elem);
@@ -96,6 +134,10 @@ function renderLayout(ctx, node_width, target, layout) {
                 break;
         }
 
+        if (elem.merge_target) {
+            color = merge_node_color;
+        }
+
         if (target && target.index == elem.val.index && target.node_type == elem.val.node_type) {
             color = "orange";
         }
@@ -103,7 +145,10 @@ function renderLayout(ctx, node_width, target, layout) {
     }
 
     for (let elem of layout.cells) {
-        renderCell(ctx, elem.val, elem.x, elem.y);
+        let color = default_cell_color;
+        if (elem.to_delete) color = delete_cell_color;
+        if (elem.to_merge) color = merge_node_color;
+        renderCell(ctx, elem.val, elem.x, elem.y, color);
     }
 }
 
@@ -169,7 +214,7 @@ class Page {
             if (x >= elem.x - half_cell_width && x <= elem.x + half_cell_width &&
                 y >= elem.y - half_cell_height && y <= elem.y + half_cell_height
             ) {
-                await fetch("/delete");
+                await fetch("/delete?val=" + elem.val);
                 await this.updateStateAndRerender();
                 break;
             }
